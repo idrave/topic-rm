@@ -5,8 +5,10 @@ from yaml import Loader, Dumper
 from lm_dataformat import Archive
 from pathlib import Path
 import time
+from datetime import datetime
 from dataloader import CorpusLoader
 import random
+import torch
 
 random.seed(42)
 
@@ -23,6 +25,9 @@ cache = config['cache']
 tokenizer = GPT2Tokenizer.from_pretrained(model_name, cache_dir=cache)
 model = GPTNeoForCausalLM.from_pretrained(model_name, cache_dir=cache).to('cuda')
 
+def get_timestamp_str():
+    return datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
 n = config['num_samples']
 batch = config['batch_size']
 max_length = config['max_length']
@@ -33,7 +38,7 @@ init_phase = config['init_phase']
 init_top_p = config['init_top_p']
 init_temp = config['init_temp']
 init_top_k = config['init_top_k']
-output = Path(config['output'])/('%s_%d' % (config['id'], time.time()))
+output = Path(config['output'])/('%s_%s' % (config['id'], get_timestamp_str()))
 prompt_corpus = config.get('prompt_corpus', None)
 prompt_prob = config.get('prompt_prob', None)
 #workers = config['workers']
@@ -61,12 +66,12 @@ for i in range((n+batch-1)//batch):
     if init_phase is not None:
         if corpus_iter is not None:
             prompts = []
-            while len(prompts) < range(batch):
+            while len(prompts) < batch:
                 text = next(corpus_iter)
                 tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=init_phase).input_ids
-                if len(tokens) == init_phase:
+                if tokens.shape[1] == init_phase:
                     prompts.append(tokens)
-            warmup = torch.stack(prompts).to('cuda')
+            warmup = torch.concat(prompts, dim=0).to('cuda')
             prefixes = [tokenizer.decode(sentence) for sentence in warmup]
         else:
             warmup = model.generate(input_ids, do_sample=True, min_length=init_phase,
