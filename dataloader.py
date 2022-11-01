@@ -9,7 +9,6 @@ class CorpusLoader:
     def __init__(self, path, transforms=None, set_names=None):
         self.dataset_file = path
         self.reader = Reader(self.dataset_file)
-        self.stream = None
         self.transforms = transforms
         self.set_names = set_names
         self.__len = None
@@ -37,8 +36,15 @@ class CorpusLoader:
             if b:
                 yield doc
 
-    def random_loader(self, max_samples, p):
-        return CorpusRandLoader(self, max_sample=max_samples, p=p)
+    def random_loader(self, p):
+        return CorpusRandLoader(self, p=p)
+
+    def iter_offset(self, offset):
+        it = iter(self)
+        for _ in range(offset):
+            next(it)
+        return it
+
 
 class GensimCorpusLoader(CorpusLoader):
     def __init__(self, path, dictionary, set_names=None):
@@ -88,21 +94,26 @@ class MmCorpusLoader:
         return self.__len
 
 class CorpusRandLoader:
-    def __init__(self, corpus, max_sample=100000, p=0.1):
+    def __init__(self, corpus, p=0.1):
         self.corpus = corpus
-        self.max_sample = max_sample
         self.p = p
     
     def __iter__(self):
-        it = iter(self.corpus)
-        for i in range(self.max_sample):
+        for s in self.corpus:
             sample = None
             while sample is None:
-                try:
-                    s = next(it)
-                except StopIteration as e:
-                    print('Run out of docs!')
-                    raise e
                 if random.random() < self.p:
                     sample = s
             yield sample
+
+class TopicDataset(GensimCorpusLoader):
+    def __init__(self, path, dictionary, topic_model, topic_id):
+        super().__init__(path, dictionary)
+        self.dataset_file = path
+        self.reader = Reader(self.dataset_file)
+        self.topic_model = topic_model
+        self.topic_id = topic_id
+    
+    def __iter__(self):
+        for text in super():
+            pass

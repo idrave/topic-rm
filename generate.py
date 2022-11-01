@@ -40,7 +40,7 @@ init_temp = config['init_temp']
 init_top_k = config['init_top_k']
 output = Path(config['output'])/('%s_%s' % (config['id'], get_timestamp_str()))
 prompt_corpus = config.get('prompt_corpus', None)
-prompt_prob = config.get('prompt_prob', None)
+corpus_offset = config.get('corpus_offset', None)
 #workers = config['workers']
 
 print(output)
@@ -56,18 +56,22 @@ input_ids = eot.repeat(batch, 1)
 
 corpus_iter = None
 if init_phase is not None and prompt_corpus is not None:
-    assert prompt_prob is not None, "If prompt_corpus is set, prompt_prob should be an int not None"
-    corpus_iter = iter(CorpusLoader(prompt_corpus).random_loader(max_samples=batch*((n+batch-1)//batch), p=prompt_prob))
+    if corpus_offset is None:
+        corpus_offset = 0
+    corpus_iter = iter(CorpusLoader(prompt_corpus).iter_offset(corpus_offset))
+    corpus_index = corpus_offset
 
+log_dict = {}
 # TODO: could fail if run out of data
 for i in range((n+batch-1)//batch):
     start_gen = time.time()
     prefixes = None
     if init_phase is not None:
-        if corpus_iter is not None:
+        if prompt_corpus is not None:
             prompts = []
             while len(prompts) < batch:
                 text = next(corpus_iter)
+                corpus_index += 1
                 tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=init_phase).input_ids
                 if tokens.shape[1] == init_phase:
                     prompts.append(tokens)
@@ -95,6 +99,9 @@ for i in range((n+batch-1)//batch):
 start_commit = time.time()
 archive.commit()
 yaml.dump(config, open(output/'config.yaml', 'w'), Dumper=Dumper)
+
+if init_phase is not None and prompt_corpus is not None:
+    open(output/'corpus_index', 'w').write('%d' % corpus_index)
 
 print('Commit', time.time() - start_commit)
 print('Generation', generate_time)
