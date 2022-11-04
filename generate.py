@@ -15,6 +15,7 @@ random.seed(42)
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--config', required=True)
+parser.add_argument('--jobid', default=None)
 
 args = parser.parse_args()
 config = yaml.load(open(args.config, 'r'), Loader=Loader)
@@ -38,9 +39,15 @@ init_phase = config['init_phase']
 init_top_p = config['init_top_p']
 init_temp = config['init_temp']
 init_top_k = config['init_top_k']
-output = Path(config['output'])/('%s_%s' % (config['id'], get_timestamp_str()))
 prompt_corpus = config.get('prompt_corpus', None)
 corpus_offset = config.get('corpus_offset', None)
+if args.jobid is None:
+    output = Path(config['output'])/('%s_%s' % (config['id'], get_timestamp_str()))
+else:
+    output = Path(config['output'])/('%s_%s_%s' % (config['id'], get_timestamp_str(), args.jobid))
+    if prompt_corpus is not None:
+        prompt_corpus = prompt_corpus.format(id=args.jobid)
+
 #workers = config['workers']
 
 print(output)
@@ -78,13 +85,16 @@ for i in range((n+batch-1)//batch):
             warmup = torch.concat(prompts, dim=0).to('cuda')
             prefixes = [tokenizer.decode(sentence) for sentence in warmup]
         else:
-            warmup = model.generate(input_ids, do_sample=True, min_length=init_phase,
+            attention_mask = (input_ids != tokenizer.eos_token_id).long()
+            warmup = model.generate(input_ids, pad_token_id=tokenizer.eos_token_id, do_sample=True, min_length=init_phase,
                                     max_length=init_phase, temperature=init_temp,
-                                    top_p=init_top_p, top_k=init_top_k)
-        sample_output = model.generate(warmup, do_sample=True, max_length=max_length,
+                                    top_p=init_top_p, top_k=init_top_k)[:,1:] # exclude first padding token
+        attention_mask = (warmup != tokenizer.eos_token_id).long()
+        sample_output = model.generate(warmup, pad_token_id=tokenizer.eos_token_id, do_sample=True, max_length=max_length,
                                 temperature=temp, top_p=top_p, top_k=top_k)
     else:
-        sample_output = model.generate(input_ids, do_sample=True, max_length=max_length,
+        attention_mask = (input_ids != tokenizer.eos_token_id).long()
+        sample_output = model.generate(input_ids, pad_token_id=tokenizer.eos_token_id, do_sample=True, max_length=max_length+1, # add one to count for padding token
                                 temperature=temp, top_p=top_p, top_k=top_k)
     start_decode = time.time()
     generate_time += start_decode - start_gen
