@@ -1,6 +1,7 @@
 lsf.*
-topicrm
+venv/topicrm
 .vscode
 __pycache__
 .ipynb_checkpoints
 notebooks/*.jpg
+*.egg-info
