@@ -168,7 +168,7 @@ class FinetuneDataset(IterableDataset):
         self.non_topic_iter = iter(self.non_topic_data)
 
     def __iter__(self):
-        for doc1 in self.topic_iter:
+        for doc1 in self.topic_data:
             doc2 = next(self.non_topic_iter, None)
             if doc2 is None:
                 self.non_topic_iter = iter(self.non_topic_data)
