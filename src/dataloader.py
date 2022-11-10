@@ -132,7 +132,7 @@ class TopicDataset:
     def __iter__(self):
         if self.datapath.is_dir():
             files = self.datapath.iterdir()
-            npz_files = (self.probs/('%s.npz' % path.name) for path in files)
+            npz_files = (self.probs/('%s.npz' % path.stem) for path in files)
         else:
             files = [self.datapath]
             npz_files = [self.probs]
@@ -163,9 +163,16 @@ class FinetuneDataset(IterableDataset):
         self.topic_data = CorpusLoader(topic_data)
         self.non_topic_data = TopicDataset(data, topic_prob_path, topic_ids,
                                             threshold=threshold, keep=False)
+        # if size of non_topic_data larger than size of topic_data,
+        # iterate multiple times over the former 
+        self.non_topic_iter = iter(self.non_topic_data)
 
     def __iter__(self):
-        for doc1, doc2 in zip(self.topic_data, self.non_topic_data):
+        for doc1 in self.topic_iter:
+            doc2 = next(self.non_topic_iter, None)
+            if doc2 is None:
+                self.non_topic_iter = iter(self.non_topic_data)
+                doc2 = next(self.non_topic_iter)
             yield doc1, doc2
 
 if __name__ == "__main__":

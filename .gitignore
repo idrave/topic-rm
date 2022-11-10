@@ -1,0 +1,6 @@
+lsf.*
+topicrm
+.vscode
+__pycache__
+.ipynb_checkpoints
+notebooks/*.jpg
