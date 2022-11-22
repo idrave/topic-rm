@@ -3,13 +3,16 @@ from lm_dataformat import Reader, Archive
 from pathlib import Path
 from gensim.corpora.mmcorpus import MmCorpus
 from gensim.parsing.preprocessing import remove_stopwords, preprocess_string, strip_short, strip_tags, strip_multiple_whitespaces,strip_numeric,stem_text
-from torch.utils.data import IterableDataset
 from scipy import sparse
 import numpy as np
 import random
 import string
 import argparse
 import yaml
+import logging
+from torch.utils.data import IterableDataset
+
+logger = logging.getLogger(__name__)
 
 class CorpusLoader:
     def __init__(self, path, transforms=None, set_names=None):
@@ -17,7 +20,13 @@ class CorpusLoader:
         self.reader = Reader(self.dataset_file)
         self.transforms = transforms
         self.set_names = set_names
-        self.__len = None
+        info_path = Path(path)/'info.yaml'
+        if Path(path).is_dir() and info_path.exists():
+            logger.debug('Found info.yaml for %s'%path)
+            info = yaml.load(open(str(info_path), 'r'), Loader=yaml.Loader)
+            self.__len = info.get('length', None)
+        else:
+            self.__len = None
     
     def __iter__(self):
         for text, meta in self.reader.stream_data(get_meta=True):
@@ -129,20 +138,23 @@ class TopicDataset:
         self.threshold = threshold
         self.keep = keep
 
-    def __iter__(self):
+    def iter_files(self):
         if self.datapath.is_dir():
             files = self.datapath.iterdir()
             npz_files = (self.probs/('%s.npz' % path.stem) for path in files)
         else:
             files = [self.datapath]
             npz_files = [self.probs]
-
         for data, topic_prob_file in zip(files, npz_files):
             try:
                 probs = sparse.load_npz(topic_prob_file).toarray()
             except:
                 print('Error: failed to load %s for %s' % (topic_prob_file, data))
                 continue
+            yield data, probs
+
+    def __iter__(self):
+        for data, probs in self.iter_files():
             if self.keep:
                 to_yield = np.any(probs[:,self.topic_ids] >= self.threshold, axis=1)
             else:
@@ -151,16 +163,54 @@ class TopicDataset:
                 if b:
                     yield doc
     
+    def __len__(self):
+        for _, probs in self.iter_files():
+            if self.keep:
+                return np.sum(np.any(probs[:,self.topic_ids] >= self.threshold, axis=1))
+            else:
+                return np.sum(np.any(probs[:,self.topic_ids] < self.threshold, axis=1))
+    
     def save(self, output):
         archive = Archive(output)
         for doc in self:
             archive.add_data(doc)
         archive.commit()
+        self.write_info(output)
+
+    def write_info(self, output):
+        info = {
+            "length": len(self),
+            "datapath": str(self.datapath),
+            "probs": str(self.probs),
+            "topic_ids": self.topic_ids,
+            "threshold": self.threshold,
+            "keep": self.keep
+        }
+        yaml.dump(info, open(Path(output)/"info.yaml",'w'), Dumper=yaml.Dumper)
+
+class ConcatDataset:
+    def __init__(self, datasets):
+        self.datasets = datasets
+        self.__len = None
+
+    def __iter__(self):
+        for dataset in self.datasets:
+            for data in dataset:
+                yield data
+
+    def __len__(self):
+        if self.__len is None:
+            self.__len = sum(len(dataset) for dataset in self.datasets)
+        return self.__len        
+    
+    @staticmethod
+    def corpus_from_dir(path):
+        return ConcatDataset([CorpusLoader(p) for p in Path(path).iterdir()])
 
 class FinetuneDataset(IterableDataset):
     def __init__(self, data, topic_prob_path, topic_data, topic_ids, threshold=0.75):
         # TODO how to match threshold with topic_prob_path's
-        self.topic_data = CorpusLoader(topic_data)
+        self.topic_data = topic_data
         self.non_topic_data = TopicDataset(data, topic_prob_path, topic_ids,
                                             threshold=threshold, keep=False)
         # if size of non_topic_data larger than size of topic_data,
@@ -195,3 +245,4 @@ if __name__ == "__main__":
     dataset = TopicDataset(data, topics, topic_ids, threshold=threshold)
     Path(output).mkdir(parents=True, exist_ok=True)
     dataset.save(output)
+    #dataset.write_info(output)
