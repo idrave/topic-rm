@@ -131,12 +131,13 @@ class CorpusRandLoader:
             yield sample
 
 class TopicDataset:
-    def __init__(self, path, topic_prob_path, topic_ids, threshold=0.75, keep=True):
+    def __init__(self, path, topic_prob_path, topic_ids, threshold=0.75, keep=True, get_meta=False):
         self.datapath = Path(path)
         self.probs = Path(topic_prob_path)
         self.topic_ids = topic_ids
         self.threshold = threshold
         self.keep = keep
+        self.get_meta = get_meta
 
     def iter_files(self):
         if self.datapath.is_dir():
@@ -159,7 +160,7 @@ class TopicDataset:
                 to_yield = np.any(probs[:,self.topic_ids] >= self.threshold, axis=1)
             else:
                 to_yield = np.any(probs[:,self.topic_ids] < self.threshold, axis=1)
-            for doc, b in zip(Reader(str(data)).stream_data(), to_yield):                
+            for doc, b in zip(Reader(str(data)).stream_data(get_meta=self.get_meta), to_yield):                
                 if b:
                     yield doc
     

@@ -9,7 +9,7 @@ def log_prob(logits, target, mask):
     probs = torch.softmax(logits, dim=2)
     target_p = torch.gather(probs, 2, target.unsqueeze(2)).squeeze()
     seq_len_mask = mask.sum(dim=1)
-    avg_log_p = (torch.log(target_p) * mask).sum(dim=1) / seq_len_mask
+    avg_log_p = ((torch.log(target_p) * mask)/ seq_len_mask.unsqueeze(1)).sum(dim=1) 
     return avg_log_p.mean()
 
 def kl_loss(logits0, logitsf, mask):
