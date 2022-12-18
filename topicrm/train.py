@@ -30,14 +30,20 @@ def prepare_dataloader(config, tokenizer, accelerator=None):
     threshold = config['thresh']
     batch_size = config["batch_size"]
     val_batch_size = config["val_batch_size"]
+    include_set = set(config["include_set"]) if "include_set" in config else None
+    exclude_set = set(config["exclude_set"]) if "exclude_set" in config else None
+    if include_set is not None:
+        logger.info("Including data only from sets %s"%(include_set))
+    if exclude_set is not None:
+        logger.info("Excluding data from sets %s"%(exclude_set))
     if config["topicdata_type"] == "CorpusLoader":
-        topic_data = CorpusLoader(config["topicdata"])
+        topic_data = CorpusLoader(config["topicdata"], include=include_set, exclude=exclude_set)
     elif config["topicdata_type"] == "ConcatDataset":
-        topic_data = ConcatDataset.corpus_from_dir(config["topicdata"])
+        topic_data = ConcatDataset.corpus_from_dir(config["topicdata"], include=include_set, exclude=exclude_set)
     else:
         raise NotImplementedError("Not implemented %s"%(config["topicdata_type"]))
     if config["val_topicdata_type"] == "CorpusLoader":
-        val_topic_data = CorpusLoader(config["val_topicdata"])
+        val_topic_data = CorpusLoader(config["val_topicdata"], include=include_set, exclude=exclude_set)
     else:
         raise NotImplementedError("Not implemented %s"%(config["val_topicdata_type"]))
     dataset = FinetuneDataset(all_data, topic_probs, topic_data,
@@ -141,8 +147,8 @@ def log_val(summary_writer: SummaryWriter, config, n_step, tokenizer, modelf, va
             all_loss_notopic = all_loss_notopic.mean()
         else:
             all_loss_topic, all_loss_notopic = loss_topic, loss_notopic
-        total_loss_topic.append(all_loss_topic)
-        total_loss_notopic.append(all_loss_notopic)
+        total_loss_topic.append(all_loss_topic.detach().float())
+        total_loss_notopic.append(all_loss_notopic.detach().float())
         n_batches += 1
         if progress_bar is not None:
             progress_bar.update(n_batches)
@@ -175,9 +181,12 @@ def show_gpu(msg):
 def save_state(accelerator: Accelerator, model, output_dir):
     accelerator.wait_for_everyone()
     accelerator.save_state(output_dir)
-    accelerator.save(model.module.state_dict(), output_dir/"model_state.pkl")
-    accelerator.save(model.config, output_dir/'config.json')
-
+    if accelerator.is_main_process:
+        model.module.config.save_pretrained(output_dir)
+    # unwrapped_model = accelerator.unwrap_model(model)
+    # for k, v in unwrapped_model.state_dict().items():
+    #     print(k, v.shape)
+    # unwrapped_model.save_pretrained(output_dir/'hfmodel', save_function=accelerator.save)
 
 def train(cmd=None):
     parser = argparse.ArgumentParser()
@@ -260,6 +269,8 @@ def train(cmd=None):
                     all_loss_notopic = all_loss_notopic.mean()
                 else:
                     all_loss_topic, all_loss_notopic = loss_topic, loss_notopic
+                all_loss_topic = all_loss_topic.detach().float()
+                all_loss_notopic = all_loss_notopic.detach().float()
                 log_train(summary_writer, n_step, all_loss_topic, all_loss_notopic, lr_scheduler)
             
             if n_step % val_log_freq == 0 and n_step > 0:
