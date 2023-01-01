@@ -18,6 +18,7 @@ import shutil
 import logging
 import time
 import subprocess
+from utils import get_timestamp_str, show_gpu
 
 logger = logging.getLogger(__file__)
 
@@ -83,9 +84,6 @@ def prepare_optimizer_scheduler(config, model):
         num_warmup_steps=config.get('num_warmup_steps', None)
     )
     return optimizer, scheduler
-
-def get_timestamp_str():
-    return datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
 def log_train(summary_writer: SummaryWriter, n_step, loss_topic, loss_no_topic, scheduler):
     logger.info('Step {}, loss {}, topic {}, no topic {}'.format(n_step, loss_topic+loss_no_topic, loss_topic, loss_no_topic))
@@ -160,24 +158,6 @@ def log_val(summary_writer: SummaryWriter, config, n_step, tokenizer, modelf, va
     summary_writer.add_scalar('val/loss', (torch.tensor(total_loss_topic) + torch.tensor(total_loss_notopic)).mean() , n_step)
     summary_writer.add_scalar('val/time', total_time)
 
-def show_gpu(msg):
-    """
-    ref: https://discuss.pytorch.org/t/access-gpu-memory-usage-in-pytorch/3192/4
-    """
-    def query(field):
-        return(subprocess.check_output(
-            ['nvidia-smi', f'--query-gpu={field}',
-                '--format=csv,nounits,noheader'], 
-            encoding='utf-8'))
-    def to_int(result):
-        return np.array(list(map(int,result.strip().split('\n'))))
-    used = to_int(query('memory.used'))
-    total = to_int(query('memory.total'))
-    pct = used/total
-    for i, p in enumerate(pct):
-        logger.debug(msg+f'Memory cuda:{i}. {100*p:2.1f}% ({used[i]} out of {total[i]})')    
-    return pct
-
 def save_state(accelerator: Accelerator, model, output_dir):
     accelerator.wait_for_everyone()
     accelerator.save_state(output_dir)
@@ -214,6 +194,7 @@ def train(cmd=None):
     if not isinstance(numeric_level, int):
         raise ValueError('Invalid log level: %s' % loglevel)
     logging.basicConfig(level=numeric_level, filename=str(output_dir / 'logs.txt'), filemode='a')
+    yaml.dump(config, open(output_dir/'config.yaml', 'w'), Dumper=yaml.Dumper)
 
     accelerator = None
     if config["accelerate"]:
@@ -291,7 +272,6 @@ def train(cmd=None):
         if epoch % save_freq == 0 and epoch > 0:
             save_state(accelerator, modelf, output_model_dir)
     save_state(accelerator, modelf, output_model_dir)
-    yaml.dump(config, open(output_dir/'config.yaml', 'w'), Dumper=yaml.Dumper)
 
 if __name__ == "__main__":
     train()

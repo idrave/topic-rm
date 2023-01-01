@@ -1,7 +1,9 @@
 from typing import Iterable
 from lm_dataformat import Reader, Archive
 from pathlib import Path
+from gensim.models import LdaModel
 from gensim.corpora.mmcorpus import MmCorpus
+from gensim.corpora import Dictionary
 from gensim.parsing.preprocessing import remove_stopwords, preprocess_string, strip_short, strip_tags, strip_multiple_whitespaces,strip_numeric,stem_text
 from scipy import sparse
 import numpy as np
@@ -73,9 +75,9 @@ class CorpusLoader:
 
 
 class GensimCorpusLoader(CorpusLoader):
-    def __init__(self, path, dictionary, include=None):
+    def __init__(self, path, dictionary, include=None, exclude=None):
         transforms = [GensimCorpusLoader.preprocessing(), dictionary.doc2bow]
-        super().__init__(path, include=include, transforms=transforms)
+        super().__init__(path, include=include, exclude=exclude, transforms=transforms)
 
     @staticmethod
     def preprocessing():
@@ -89,6 +91,28 @@ class GensimCorpusLoader(CorpusLoader):
             strip_short
         ]
         return lambda x: preprocess_string(x, parse)
+
+class TopicLoaderLda(CorpusLoader):
+    def __init__(self, path, dictionary: Dictionary, ldamodel: LdaModel, topic_ids, threshold=0.75, keep=True, include=None, exclude = None):
+        super().__init__(path, include=include, exclude=exclude)
+        self.dictionary = dictionary
+        self.ldamodel = ldamodel
+        self.topic_ids = topic_ids
+        self.keep = keep
+        self.threshold = threshold
+
+    def __iter__(self):
+        preprocessing = GensimCorpusLoader.preprocessing()
+        for doc in super().__iter__():
+            bow = self.dictionary.doc2bow(preprocessing(doc))
+            topics = self.ldamodel.get_document_topics(bow)
+            has_topics = False
+            for topic, prob in topics:
+                if topic in self.topic_ids and prob >= self.threshold:
+                    has_topics = True
+                    break
+            if has_topics == self.keep:
+                yield doc
 
 class MmCorpusLoader:
     def __init__(self, path):
