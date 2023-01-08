@@ -1,4 +1,3 @@
-from typing import Iterable
 from lm_dataformat import Reader, Archive
 from pathlib import Path
 from gensim.models import LdaModel
@@ -13,17 +12,23 @@ import argparse
 import yaml
 import logging
 from torch.utils.data import IterableDataset
+from topicrm.utils import thread_pool_iter, generator_to_queue
 
 logger = logging.getLogger(__name__)
 
+TEXT_KEY = 'text'
+PROB_KEY = 'prob'
+META_KEY = 'meta'
+
 class CorpusLoader:
-    def __init__(self, path, transforms=None, include=None, exclude=None):
+    def __init__(self, path, transforms=None, include=None, exclude=None, return_dict=False):
         self.dataset_file = path
         self.reader = Reader(self.dataset_file)
         self.transforms = transforms
         self.include = include
         self.exclude = exclude
         info_path = Path(path)/'info.yaml'
+        self.return_dict = return_dict
         if Path(path).is_dir() and info_path.exists():
             logger.debug('Found info.yaml for %s'%path)
             info = yaml.load(open(str(info_path), 'r'), Loader=yaml.Loader)
@@ -31,23 +36,26 @@ class CorpusLoader:
         else:
             self.__len = None
 
-    def is_pile_set_included(self, pile_set):
+    def is_pile_set_included(self, pile_set): #TODO: should do this in different Pile loader class
         return ((self.include is None or pile_set in self.include) \
                 and (self.exclude is None or pile_set not in self.exclude))
     
     def __iter__(self):
         for text, meta in self.reader.stream_data(get_meta=True):
-            if self.is_pile_set_included(meta["pile_set_name"]):
+            if (self.include is None and self.exclude is None) or self.is_pile_set_included(meta["pile_set_name"]):
                 doc = text
                 if self.transforms != None:
                     try:
                         for transform in self.transforms:
                             doc = transform(doc)
                     except RecursionError as e:
-                        logger.warn('Failed to apply transforms with input:\n"%s"'%(text)) # TODO: do proper logging
+                        logger.warn('Failed to apply transforms with input:\n"%s"'%(text)) 
                         yield None
                         continue
-                yield doc
+                if self.return_dict:
+                    yield {TEXT_KEY: doc}
+                else:
+                    yield doc
                 
     def __len__(self):
         if self.__len != None:
@@ -92,27 +100,43 @@ class GensimCorpusLoader(CorpusLoader):
         ]
         return lambda x: preprocess_string(x, parse)
 
-class TopicLoaderLda(CorpusLoader):
-    def __init__(self, path, dictionary: Dictionary, ldamodel: LdaModel, topic_ids, threshold=0.75, keep=True, include=None, exclude = None):
-        super().__init__(path, include=include, exclude=exclude)
+class TopicLoaderLda:
+    def __init__(self, corpus, dictionary: Dictionary, ldamodel: LdaModel, topic_ids, threshold=0.75, keep=True):
+        self.corpus = corpus
         self.dictionary = dictionary
         self.ldamodel = ldamodel
         self.topic_ids = topic_ids
         self.keep = keep
         self.threshold = threshold
 
+    @generator_to_queue
     def __iter__(self):
         preprocessing = GensimCorpusLoader.preprocessing()
-        for doc in super().__iter__():
-            bow = self.dictionary.doc2bow(preprocessing(doc))
+        for doc in self.corpus:
+            bow = self.dictionary.doc2bow(preprocessing(doc[TEXT_KEY]))
             topics = self.ldamodel.get_document_topics(bow)
             has_topics = False
+            probsum = 0.0
             for topic, prob in topics:
-                if topic in self.topic_ids and prob >= self.threshold:
-                    has_topics = True
-                    break
+                if topic in self.topic_ids:
+                    probsum += prob 
+                    if prob >= self.threshold:
+                        has_topics = True
             if has_topics == self.keep:
+                doc[PROB_KEY] = probsum
                 yield doc
+
+class MaxTokenLoader:
+    def __init__(self, corpus, tokenizer, max_length) -> None:
+        self.corpus = corpus
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __iter__(self):
+        for doc in self.corpus:
+            tokens = self.tokenizer.encode(doc[TEXT_KEY])
+            for i in range(0, len(tokens), self.max_length):
+                yield {TEXT_KEY: self.tokenizer.decode(tokens[i:i+self.max_length], skip_special_tokens=True)}
 
 class MmCorpusLoader:
     def __init__(self, path):
@@ -184,6 +208,15 @@ class TopicDataset:
                 continue
             yield data, probs
 
+    def compute_prior_topic(self):
+        sizes = []
+        avgs = []
+        topic_ids = np.array(self.topic_ids)
+        for _, probs in self.iter_files():
+            avgs.append(np.mean(probs[:,topic_ids].sum(axis=1)))
+            sizes.append(probs.shape[0])
+        return np.dot(avgs, np.array(sizes) / np.sum(sizes))
+
     def __iter__(self):
         topic_ids = np.array(self.topic_ids)
         for data, probs in self.iter_files():
@@ -191,8 +224,9 @@ class TopicDataset:
             for doc, topics in zip(Reader(str(data)).stream_data(get_meta=self.get_meta), doc_topics):                
                 if any(topics) == self.keep:
                     if self.get_meta:
-                        doc[1]["topics"] = topic_ids[topics].tolist()
-                    yield doc
+                        yield {TEXT_KEY: doc[0], META_KEY: doc[1]}
+                    else:
+                        yield {TEXT_KEY: doc}
     
     def __len__(self):
         for _, probs in self.iter_files():
@@ -205,9 +239,9 @@ class TopicDataset:
         archive = Archive(output)
         for doc in self:
             if not self.get_meta:
-                archive.add_data(doc)
+                archive.add_data(doc[TEXT_KEY])
             else:
-                archive.add_data(doc[0], meta=doc[1])
+                archive.add_data(doc[TEXT_KEY], meta=doc[META_KEY])
         archive.commit()
         self.write_info(output)
 
@@ -239,14 +273,13 @@ class ConcatDataset:
     
     @staticmethod
     def corpus_from_dir(path, include=None, exclude=None):
-        return ConcatDataset([CorpusLoader(p, include=include, exclude=exclude) for p in Path(path).iterdir()])
+        return ConcatDataset([CorpusLoader(str(p), include=include, exclude=exclude, return_dict=True) for p in Path(path).iterdir()])
 
 class FinetuneDataset(IterableDataset):
-    def __init__(self, data, topic_prob_path, topic_data, topic_ids, threshold=0.75):
+    def __init__(self, topic_data, non_topic_data):
         # TODO how to match threshold with topic_prob_path's
         self.topic_data = topic_data
-        self.non_topic_data = TopicDataset(data, topic_prob_path, topic_ids,
-                                            threshold=threshold, keep=False)
+        self.non_topic_data = non_topic_data
         # if size of non_topic_data larger than size of topic_data,
         # iterate multiple times over the former 
         self.non_topic_iter = iter(self.non_topic_data)

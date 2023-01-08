@@ -22,8 +22,9 @@ config = yaml.load(open(args.config, 'r'), Loader=Loader)
 
 model_name = config['model']
 cache = config['cache']
+tok_name = config['tokenizer'] if config.get('tokenizer', None) is not None else model_name
 
-tokenizer = GPT2Tokenizer.from_pretrained(model_name, cache_dir=cache)
+tokenizer = GPT2Tokenizer.from_pretrained(tok_name, cache_dir=cache)
 model = GPTNeoForCausalLM.from_pretrained(model_name, cache_dir=cache).to('cuda')
 
 def get_timestamp_str():

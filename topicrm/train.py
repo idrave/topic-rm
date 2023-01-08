@@ -3,72 +3,100 @@ from pathlib import Path
 import yaml
 from tqdm.auto import tqdm
 from transformers import get_scheduler, GPT2Tokenizer, GPTNeoForCausalLM
-from lm_dataformat import Archive
-from topicrm.dataloader import FinetuneDataset, CorpusLoader, ConcatDataset
+from topicrm.dataloader import FinetuneDataset, CorpusLoader, ConcatDataset, TopicLoaderLda, TopicDataset, MaxTokenLoader
+import topicrm.dataloader
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch
 from torch.optim import AdamW
-from topicrm.losses import log_prob, kl_loss
-from datetime import datetime
+from topicrm.losses import log_prob, weighted_log_prob
 from accelerate import Accelerator
-from datasets import Dataset
-import numpy as np
-import shutil
 import logging
 import time
-import subprocess
-from utils import get_timestamp_str, show_gpu
+from topicrm.utils import get_timestamp_str, show_gpu, CheckpointManager
+from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict
+from gensim.corpora import Dictionary
+from gensim.models import LdaModel
+from contextlib import nullcontext
 
 logger = logging.getLogger(__file__)
+
+def load_dataset(dataset_type, tokenizer, all_data, topic_data, topic_probs, topic_ids,
+                    threshold, include_set, exclude_set, max_length, ldamodel, dictionary):
+    if dataset_type == "TopicLoaderLda":
+        topic_corpus = CorpusLoader(all_data, include=include_set, exclude=exclude_set, return_dict=True)
+        non_topic_corpus = CorpusLoader(all_data, return_dict=True)
+        if max_length != tokenizer.model_max_length:
+            topic_corpus = MaxTokenLoader(topic_corpus, tokenizer, max_length)
+            non_topic_corpus = MaxTokenLoader(non_topic_corpus, tokenizer, max_length)
+        dictionary = Dictionary.load(dictionary)
+        ldamodel = LdaModel.load(ldamodel)
+        topic_data = TopicLoaderLda(topic_corpus, dictionary, ldamodel, topic_ids, threshold=threshold)
+        non_topic_data = TopicLoaderLda(non_topic_corpus, dictionary, ldamodel, topic_ids, threshold=threshold, keep=False)
+    else:
+        non_topic_data = TopicDataset(all_data, topic_probs, topic_ids, threshold=threshold, keep=False)
+        if dataset_type == "CorpusLoader":
+            topic_data = CorpusLoader(topic_data, include=include_set, exclude=exclude_set, return_dict=True)
+        elif dataset_type == "ConcatDataset":
+            topic_data = ConcatDataset.corpus_from_dir(topic_data, include=include_set, exclude=exclude_set)
+        else:
+            raise NotImplementedError("Not implemented %s"%(dataset_type))
+        if max_length != tokenizer.model_max_length:
+            topic_data = MaxTokenLoader(topic_data, tokenizer, max_length)
+            non_topic_data = MaxTokenLoader(non_topic_data, tokenizer, max_length)
+    return topic_data, non_topic_data
 
 def prepare_dataloader(config, tokenizer, accelerator=None):
     topic_probs = config['probpath']
     all_data = config['alldata']
+    topic_data_path = config["topicdata"]
     val_topic_probs = config['val_probpath']
     val_all_data = config['val_alldata']
+    val_topic_data_path = config['val_topicdata']
     topic_ids = config['topics']
     threshold = config['thresh']
     batch_size = config["batch_size"]
     val_batch_size = config["val_batch_size"]
     include_set = set(config["include_set"]) if "include_set" in config else None
     exclude_set = set(config["exclude_set"]) if "exclude_set" in config else None
+    if config["truncate_len"] is not None:
+        max_length = config["truncate_len"]
+    else:
+        max_length = tokenizer.model_max_length
+    logger.info(f'Max input lenght {max_length}')
+    ldamodel = config.get('ldamodel', None)
+    dictionary = config.get('dictionary', None)
+
     if include_set is not None:
         logger.info("Including data only from sets %s"%(include_set))
     if exclude_set is not None:
         logger.info("Excluding data from sets %s"%(exclude_set))
-    if config["topicdata_type"] == "CorpusLoader":
-        topic_data = CorpusLoader(config["topicdata"], include=include_set, exclude=exclude_set)
-    elif config["topicdata_type"] == "ConcatDataset":
-        topic_data = ConcatDataset.corpus_from_dir(config["topicdata"], include=include_set, exclude=exclude_set)
-    else:
-        raise NotImplementedError("Not implemented %s"%(config["topicdata_type"]))
-    if config["val_topicdata_type"] == "CorpusLoader":
-        val_topic_data = CorpusLoader(config["val_topicdata"], include=include_set, exclude=exclude_set)
-    else:
-        raise NotImplementedError("Not implemented %s"%(config["val_topicdata_type"]))
-    dataset = FinetuneDataset(all_data, topic_probs, topic_data,
-                                topic_ids, threshold=threshold)
-    val_dataset = FinetuneDataset(val_all_data, val_topic_probs, val_topic_data,
-                                topic_ids, threshold=threshold)
 
-    max_length = None
-    if config["truncate_len"] is not None:
-        max_length = config["truncate_len"]
+    topic_data, non_topic_data = load_dataset(config["topicdata_type"], tokenizer, all_data, topic_data_path, topic_probs, topic_ids,
+                    threshold, include_set, exclude_set, max_length, ldamodel, dictionary)
+    val_topic_data, val_non_topic_data = load_dataset(config["val_topicdata_type"], tokenizer, val_all_data, val_topic_data_path, val_topic_probs, topic_ids,
+                    threshold, include_set, exclude_set, max_length, ldamodel, dictionary)
+
+    dataset = FinetuneDataset(topic_data, non_topic_data)
+    val_dataset = FinetuneDataset(val_topic_data, val_non_topic_data)
 
     def tokenize_function(examples):
         samples1, samples2 = [*zip(*examples)]
+        texts1 = [x[topicrm.dataloader.TEXT_KEY] for x in samples1]
+        texts2 = [x[topicrm.dataloader.TEXT_KEY] for x in samples2]
         if accelerator is not None and accelerator.num_processes > 1:
             padding = 'max_length'
         else:
             padding = 'longest'
-        outputs1 = tokenizer(samples1, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).input_ids
-        outputs2 = tokenizer(samples2, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).input_ids
-        att_mask_1      = (outputs1      != tokenizer.pad_token_id).long()
-        att_mask_2    = (outputs2    != tokenizer.pad_token_id).long()
-        return (outputs1, att_mask_1), (outputs2, att_mask_2)
+        outputs1 = tokenizer(texts1, return_tensors="pt", padding=padding, truncation=True, max_length=max_length)
+        outputs2 = tokenizer(texts2, return_tensors="pt", padding=padding, truncation=True, max_length=max_length)
+        if topicrm.dataloader.PROB_KEY in samples1[0]:
+            outputs1[topicrm.dataloader.PROB_KEY] = torch.tensor([x[topicrm.dataloader.PROB_KEY] for x in samples1])
+            outputs2[topicrm.dataloader.PROB_KEY] = torch.tensor([x[topicrm.dataloader.PROB_KEY] for x in samples2])
+        return outputs1, outputs2
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=tokenize_function)
     val_dataloader = DataLoader(val_dataset, batch_size=val_batch_size, collate_fn=tokenize_function)
+
     return dataloader, val_dataloader
 
 def prepare_optimizer_scheduler(config, model):
@@ -85,43 +113,41 @@ def prepare_optimizer_scheduler(config, model):
     )
     return optimizer, scheduler
 
-def log_train(summary_writer: SummaryWriter, n_step, loss_topic, loss_no_topic, scheduler):
+def log_train(config, summary_writer: SummaryWriter, n_step, loss_topic, loss_no_topic, steptime, scheduler):
     logger.info('Step {}, loss {}, topic {}, no topic {}'.format(n_step, loss_topic+loss_no_topic, loss_topic, loss_no_topic))
     summary_writer.add_scalar('lr', scheduler.get_last_lr()[0], n_step)
     summary_writer.add_scalar('train/topicloss', loss_topic, n_step)
     summary_writer.add_scalar('train/notopicloss', loss_no_topic, n_step)
     summary_writer.add_scalar('train/loss', loss_topic+loss_no_topic, n_step)
-    pct = show_gpu(f'{n_step}: ')
-    for i, p in enumerate(pct):
-        summary_writer.add_scalar(f'train/cuda:{i}-mem', p, n_step)
+    summary_writer.add_scalar('train/time', steptime, n_step)
+    if config["device"] == "cuda":
+        pct = show_gpu(f'{n_step}: ')
+        for i, p in enumerate(pct):
+            summary_writer.add_scalar(f'train/cuda:{i}-mem', p, n_step)
 
 def log_epoch(summary_writer: SummaryWriter, epoch_time):
     summary_writer.add_scalar('train/time', epoch_time)
 
 def forward_model(config, batch_topic, batch_notopic, tokenizer, modelf, model0=None):
-    input_ids_topic, att_mask_topic = batch_topic
-    input_ids_notopic, att_mask_notopic = batch_notopic
-
     if not config["accelerate"]:
-        input_ids_topic = input_ids_topic.to(config['device'])
-        input_ids_notopic = input_ids_notopic.to(config['device'])
-        att_mask_topic = att_mask_topic.to(config['device'])
-        att_mask_notopic = att_mask_notopic.to(config['device'])
+        batch_topic = batch_topic.to(config['device'])
+        batch_notopic = batch_notopic.to(config['device'])
+    
+    input_ids_topic = batch_topic.input_ids
+    input_ids_notopic = batch_notopic.input_ids
+    att_mask_topic = batch_topic.attention_mask
+    att_mask_notopic = batch_notopic.attention_mask
     logitsf_topic   = modelf(input_ids_topic,   attention_mask=att_mask_topic.long()).logits
     logitsf_notopic = modelf(input_ids_notopic, attention_mask=att_mask_notopic.long()).logits
     
-    mask_topic = att_mask_topic
-    mask_notopic = att_mask_notopic
-
-    if config["klloss"]:
-        with torch.no_grad():
-            logits0_notopic = model0(input_ids_notopic, attention_mask=att_mask_notopic)
-
-        loss_topic = log_prob(logitsf_topic, input_ids_topic, mask_topic)
-        loss_notopic = kl_loss(logits0_notopic.detach(), logitsf_notopic, mask_notopic)
-    else:
-        loss_topic = log_prob(logitsf_topic, input_ids_topic, mask_topic)
-        loss_notopic = -log_prob(logitsf_notopic, input_ids_notopic, mask_notopic)
+    if config.get('loss', 'log_prob') == 'log_prob':
+        loss_topic = log_prob(input_ids_topic, att_mask_topic, logitsf_topic)
+        loss_notopic = -log_prob(input_ids_notopic, att_mask_notopic, logitsf_notopic)
+    elif config['loss'] == 'weighted_log_prob':
+        probs = batch_topic.prob
+        probs_notopic = 1 - batch_notopic.prob
+        loss_topic = weighted_log_prob(input_ids_topic, att_mask_topic, probs, logitsf_topic)
+        loss_notopic = -weighted_log_prob(input_ids_notopic, att_mask_notopic, probs_notopic, logitsf_notopic)
 
     return loss_topic, loss_notopic, (logitsf_topic, logitsf_notopic)
 
@@ -156,17 +182,7 @@ def log_val(summary_writer: SummaryWriter, config, n_step, tokenizer, modelf, va
     summary_writer.add_scalar("val/topicloss", torch.tensor(total_loss_topic).mean(), n_step)
     summary_writer.add_scalar("val/notopicloss", torch.tensor(total_loss_notopic).mean(), n_step)
     summary_writer.add_scalar('val/loss', (torch.tensor(total_loss_topic) + torch.tensor(total_loss_notopic)).mean() , n_step)
-    summary_writer.add_scalar('val/time', total_time)
-
-def save_state(accelerator: Accelerator, model, output_dir):
-    accelerator.wait_for_everyone()
-    accelerator.save_state(output_dir)
-    if accelerator.is_main_process:
-        model.module.config.save_pretrained(output_dir)
-    # unwrapped_model = accelerator.unwrap_model(model)
-    # for k, v in unwrapped_model.state_dict().items():
-    #     print(k, v.shape)
-    # unwrapped_model.save_pretrained(output_dir/'hfmodel', save_function=accelerator.save)
+    summary_writer.add_scalar('val/time', total_time, n_step)
 
 def train(cmd=None):
     parser = argparse.ArgumentParser()
@@ -184,10 +200,9 @@ def train(cmd=None):
     train_log_freq  = config["train_log_freq"]
     val_log_freq    = config["val_log_freq"]
     save_freq = config["save_freq"]
-    use_kl      = config["klloss"]
     output_dir  = Path(config["output_dir"]) / (config["tag"] + get_timestamp_str())
-    output_model_dir = output_dir / "checkpoint"
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = CheckpointManager(output_dir)
     print('output directory:', output_dir)
     loglevel = args.log
     numeric_level = getattr(logging, loglevel.upper(), None)
@@ -211,10 +226,6 @@ def train(cmd=None):
     modelf = GPTNeoForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
     if not config["accelerate"]:
         modelf = modelf.to(device)
-    if use_kl:
-        raise NotImplementedError()
-        model0 = modelf.deepcopy()
-        model0.eval()
 
     optimizer, lr_scheduler = prepare_optimizer_scheduler(config, modelf)
     summary_writer = SummaryWriter(output_dir)
@@ -227,14 +238,16 @@ def train(cmd=None):
     for epoch in range(num_epochs):
         start = time.time()
         for batch in dataloader:
-            with accelerator.accumulate(modelf):
+            if num_training_steps is not None and n_step >= num_training_steps:
+                break
+            with accelerator.accumulate(modelf) if accelerator is not None else nullcontext():
                 modelf.train()
                 batch_topic, batch_notopic = batch
+                starttimer = time.time()
                 loss_topic, loss_notopic, (logt, lognt) = forward_model(
-                    config, batch_topic, batch_notopic, tokenizer, modelf,
-                    model0= model0 if use_kl else None
+                    config, batch_topic, batch_notopic, tokenizer, modelf
                 )
-                loss = loss_topic + loss_notopic
+                loss = 0.1* loss_topic + loss_notopic
                 if not config["accelerate"]:
                     loss.backward()
                 else:
@@ -252,26 +265,26 @@ def train(cmd=None):
                     all_loss_topic, all_loss_notopic = loss_topic, loss_notopic
                 all_loss_topic = all_loss_topic.detach().float()
                 all_loss_notopic = all_loss_notopic.detach().float()
-                log_train(summary_writer, n_step, all_loss_topic, all_loss_notopic, lr_scheduler)
+                log_train(config, summary_writer, n_step, all_loss_topic, all_loss_notopic, time.time()-starttimer, lr_scheduler)
             
+            if n_step % save_freq == 0 and n_step > 0:
+                #save_state(accelerator, modelf, output_dir / 'checkpoint_%d'%n_step)
+                checkpoint.save_checkpoint(n_step, modelf, accelerator)
+            #torch.cuda.empty_cache()
+            n_step += 1
             if n_step % val_log_freq == 0 and n_step > 0:
                 modelf.eval()
                 with torch.no_grad():
                     log_val(
-                        summary_writer, config, n_step, tokenizer, modelf, val_dataloader,
-                        model0= model0 if use_kl else None
+                        summary_writer, config, n_step, tokenizer, modelf, val_dataloader
                     )
-            n_step += 1
-            torch.cuda.empty_cache()
-            if num_training_steps is not None and n_step >= num_training_steps:
-                break
         if num_training_steps is not None and n_step >= num_training_steps:
             break
         total_time = time.time() - start
         log_epoch(summary_writer, total_time)
-        if epoch % save_freq == 0 and epoch > 0:
-            save_state(accelerator, modelf, output_model_dir)
-    save_state(accelerator, modelf, output_model_dir)
+    #save_state(accelerator, modelf, output_dir / 'checkpoint_%d'%n_step)
+    checkpoint.save_checkpoint(n_step, modelf, accelerator)
+    checkpoint.save_json()
 
 if __name__ == "__main__":
     train()
